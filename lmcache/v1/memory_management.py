@@ -374,10 +374,13 @@ class MemoryObj(metaclass=abc.ABCMeta):
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
+    use_cm_mem: bool = False,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
-    if numa_mapping:
+    if use_cm_mem:
+        ptr = lmc_ops.cm_alloc_ptr(size)
+    elif numa_mapping:
         if torch.cuda.is_available():
             current_device_id = torch.cuda.current_device()
         else:
@@ -1884,9 +1887,25 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
         self.numa_mapping = kwargs.get("numa_mapping", None)
 
+        self.use_cm_mem = kwargs.get("use_cm_mem", False)
+
         self.size = size
 
-        self.buffer = _allocate_cpu_memory(size, self.numa_mapping)
+        if self.use_cm_mem:
+            try:
+                # Third Party
+                from mooncake.store import (
+                    get_alloc_func_addr,
+                    get_free_func_addr,
+                )
+            except ImportError as e:
+                raise ImportError(
+                    "from mooncake.store import _allocate_cpu_memory/get_free_func_addr failed"
+                ) from e
+            alloc_func_addr = get_alloc_func_addr()
+            free_func_addr = get_free_func_addr()
+            lmc_ops.register_cm_memory_func(alloc_func_addr, free_func_addr);
+        self.buffer = _allocate_cpu_memory(size, self.numa_mapping, self.use_cm_mem)
 
         self._unregistered = False
 
@@ -2007,7 +2026,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 torch.cuda.synchronize()
             if self.buffer.numel() == 0:
                 return
-            if self.numa_mapping:
+            if self.use_cm_mem:
+                lmc_ops.cm_free_ptr(self.buffer.data_ptr())
+            elif self.numa_mapping:
                 lmc_ops.free_pinned_numa_ptr(self.buffer.data_ptr(), self.size)
             else:
                 lmc_ops.free_pinned_ptr(self.buffer.data_ptr())
