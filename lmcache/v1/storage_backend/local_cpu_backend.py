@@ -49,6 +49,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
+        enable_mooncake_nof_pool: Optional[bool] = None,
     ):
         if torch.cuda.is_available():
             super().__init__(dst_device)
@@ -59,6 +60,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu
+        self.enable_mooncake_nof_pool = (
+            config.enable_mooncake_nof_pool
+            if enable_mooncake_nof_pool is None
+            else enable_mooncake_nof_pool
+        )
+        self.use_cm_mem = self.enable_mooncake_nof_pool
         # NOTE: we keep the memory allocator argument for temporary
         # test compatibility
         # TODO: fix the tests to get rid the memory allocator
@@ -421,7 +428,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return MixedMemoryAllocator(
                 int(cpu_size * 1024**3),
                 numa_mapping=numa_mapping,
-                use_cm_mem=True,
+                use_cm_mem=self.use_cm_mem,
             )
 
     @_lmcache_nvtx_annotate
