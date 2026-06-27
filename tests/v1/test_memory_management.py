@@ -2,6 +2,7 @@
 # Standard
 import threading
 import time
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -323,6 +324,78 @@ def test_memory_obj_metadata_to_and_from_dict():
     assert metadata_from_dict_2.dtype == dtype1
     assert metadata_from_dict_2.shapes == shapes
     assert metadata_from_dict_2.dtypes == dtypes
+
+
+def test_mixed_memory_allocator_close_uses_cm_free(monkeypatch):
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    allocator._unregistered = False
+    allocator.use_cm_mem = True
+    allocator.numa_mapping = None
+    allocator.size = 4096
+    allocator.buffer = SimpleNamespace(numel=lambda: 1, data_ptr=lambda: 1234)
+
+    calls = {"cm_free": 0, "free_pinned": 0, "free_pinned_numa": 0}
+
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.cm_free_ptr",
+        lambda ptr: calls.__setitem__("cm_free", calls["cm_free"] + 1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.free_pinned_ptr",
+        lambda ptr: calls.__setitem__("free_pinned", calls["free_pinned"] + 1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.free_pinned_numa_ptr",
+        lambda ptr, size: calls.__setitem__(
+            "free_pinned_numa", calls["free_pinned_numa"] + 1
+        ),
+        raising=False,
+    )
+
+    allocator.close()
+
+    assert calls["cm_free"] == 1
+    assert calls["free_pinned"] == 0
+    assert calls["free_pinned_numa"] == 0
+    assert allocator._unregistered is True
+
+
+def test_mixed_memory_allocator_close_uses_native_free(monkeypatch):
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    allocator._unregistered = False
+    allocator.use_cm_mem = False
+    allocator.numa_mapping = None
+    allocator.size = 4096
+    allocator.buffer = SimpleNamespace(numel=lambda: 1, data_ptr=lambda: 1234)
+
+    calls = {"cm_free": 0, "free_pinned": 0, "free_pinned_numa": 0}
+
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.cm_free_ptr",
+        lambda ptr: calls.__setitem__("cm_free", calls["cm_free"] + 1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.free_pinned_ptr",
+        lambda ptr: calls.__setitem__("free_pinned", calls["free_pinned"] + 1),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_management.lmc_ops.free_pinned_numa_ptr",
+        lambda ptr, size: calls.__setitem__(
+            "free_pinned_numa", calls["free_pinned_numa"] + 1
+        ),
+        raising=False,
+    )
+
+    allocator.close()
+
+    assert calls["cm_free"] == 0
+    assert calls["free_pinned"] == 1
+    assert calls["free_pinned_numa"] == 0
+    assert allocator._unregistered is True
 
 
 @pytest.mark.parametrize(

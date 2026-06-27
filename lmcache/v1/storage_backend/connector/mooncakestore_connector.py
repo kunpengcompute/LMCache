@@ -223,6 +223,11 @@ class MooncakestoreConnector(RemoteConnector):
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
+        self.replica_config.nof_replica_num = (
+            1
+            if getattr(local_cpu_backend, "enable_mooncake_nof_pool", False)
+            else 0
+        )
 
         # Set preferred_segment based on configuration
         if self.config.prefer_local_alloc:

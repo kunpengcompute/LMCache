@@ -9,6 +9,9 @@
 #include <linux/mempolicy.h>  // for MPOL_BIND, MPOL_MF_MOVE, MPOL_MF_STRICT
 #include "mem_alloc.h"
 
+static alloc_func_t g_cm_alloc = nullptr;
+static free_func_t g_cm_free = nullptr;
+
 uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
   void* ptr = nullptr;
   cudaError_t err = cudaHostAlloc(&ptr, size, flags);
@@ -93,4 +96,49 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
   if (munmap(p, size) != 0) {
     throw std::runtime_error(std::string("munmap failed: ") + strerror(errno));
   }
+}
+
+void register_cm_memory_func(uintptr_t alloc_func_addr, uintptr_t free_func_addr)
+{
+    g_cm_alloc = reinterpret_cast<alloc_func_t>(alloc_func_addr);
+    g_cm_free = reinterpret_cast<free_func_t>(free_func_addr);
+}
+
+uintptr_t cm_alloc_ptr(size_t size)
+{
+  if (!g_cm_alloc || !g_cm_free) {
+    throw std::runtime_error("cm_alloc_ptr failed: alloc_func or free_func is null");
+  }
+
+  void* ptr = g_cm_alloc(size);
+  if (ptr == nullptr) {
+    throw std::runtime_error("cm_alloc_ptr failed: alloc memory failed");
+  }
+
+  cudaError_t st = cudaHostRegister(ptr, size, 0);
+  if (st != cudaSuccess) {
+    g_cm_free(ptr);
+    throw std::runtime_error(std::string("cm_alloc_ptr failed: ") +
+                             cudaGetErrorString(st));
+  }
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void cm_free_ptr(uintptr_t ptr)
+{
+  void* p = reinterpret_cast<void*>(ptr);
+  if (!p) {
+    return;
+  }
+
+  // cm_alloc_ptr already checks whether g_cm_free is null.
+
+  cudaError_t st = cudaHostUnregister(p);
+  if (st != cudaSuccess) {
+    g_cm_free(p);
+    throw std::runtime_error(std::string("cudaHostUnregister failed: ") +
+                             cudaGetErrorString(st));
+  }
+
+  g_cm_free(p);
 }

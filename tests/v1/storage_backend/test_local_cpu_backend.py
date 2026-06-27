@@ -5,6 +5,7 @@ import threading
 # Third Party
 import pytest
 import torch
+from unittest.mock import MagicMock
 
 # First Party
 from lmcache.observability import LMCStatsMonitor
@@ -40,12 +41,16 @@ class MockLMCacheWorker:
 
 
 def create_test_config(
-    local_cpu: bool = True, use_layerwise: bool = False, enable_blending: bool = False
+    local_cpu: bool = True,
+    use_layerwise: bool = False,
+    enable_blending: bool = False,
+    enable_mooncake_nof_pool: bool = False,
 ):
     """Create a test configuration for LocalCPUBackend."""
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
         local_cpu=local_cpu,
+        enable_mooncake_nof_pool=enable_mooncake_nof_pool,
         use_layerwise=use_layerwise,
         enable_blending=enable_blending,
         lmcache_instance_id="test_instance",
@@ -142,6 +147,119 @@ class TestLocalCPUBackend:
         assert backend.enable_blending is True
 
         memory_allocator.close()
+
+    def test_init_default_cm_mem_disabled(self, monkeypatch):
+        """Test LocalCPUBackend defaults to native pinned allocation."""
+
+        captured = {}
+
+        class FakeAllocator:
+            def __init__(self, size, use_paging=False, **kwargs):
+                captured["size"] = size
+                captured["use_cm_mem"] = kwargs.get("use_cm_mem")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.MixedMemoryAllocator",
+            FakeAllocator,
+        )
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.NUMADetector.get_numa_mapping",
+            lambda config: None,
+        )
+
+        config = create_test_config(enable_mooncake_nof_pool=False)
+        metadata = MagicMock()
+        metadata.use_mla = False
+        backend = LocalCPUBackend(config=config, metadata=metadata)
+
+        assert backend.enable_mooncake_nof_pool is False
+        assert backend.use_cm_mem is False
+        assert captured["use_cm_mem"] is False
+
+    def test_init_config_can_enable_cm_mem(self, monkeypatch):
+        """Test LocalCPUBackend can enable cm memory via config."""
+
+        captured = {}
+
+        class FakeAllocator:
+            def __init__(self, size, use_paging=False, **kwargs):
+                captured["use_cm_mem"] = kwargs.get("use_cm_mem")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.MixedMemoryAllocator",
+            FakeAllocator,
+        )
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.NUMADetector.get_numa_mapping",
+            lambda config: None,
+        )
+
+        config = create_test_config(enable_mooncake_nof_pool=True)
+        metadata = MagicMock()
+        metadata.use_mla = False
+        backend = LocalCPUBackend(config=config, metadata=metadata)
+
+        assert backend.enable_mooncake_nof_pool is True
+        assert backend.use_cm_mem is True
+        assert captured["use_cm_mem"] is True
+
+    def test_init_explicit_arg_overrides_config(self, monkeypatch):
+        """Test LocalCPUBackend explicit ctor arg overrides config."""
+
+        captured = {}
+
+        class FakeAllocator:
+            def __init__(self, size, use_paging=False, **kwargs):
+                captured["use_cm_mem"] = kwargs.get("use_cm_mem")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.MixedMemoryAllocator",
+            FakeAllocator,
+        )
+        monkeypatch.setattr(
+            "lmcache.v1.storage_backend.local_cpu_backend.NUMADetector.get_numa_mapping",
+            lambda config: None,
+        )
+
+        config = create_test_config(enable_mooncake_nof_pool=False)
+        metadata = MagicMock()
+        metadata.use_mla = False
+        backend = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            enable_mooncake_nof_pool=True,
+        )
+
+        assert backend.enable_mooncake_nof_pool is True
+        assert backend.use_cm_mem is True
+        assert captured["use_cm_mem"] is True
+
+    def test_close_delegates_to_memory_allocator(self):
+        """Test LocalCPUBackend.close delegates release to allocator.close()."""
+
+        config = create_test_config()
+        metadata = MagicMock()
+        metadata.use_mla = False
+        memory_allocator = MagicMock()
+
+        backend = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            memory_allocator=memory_allocator,
+        )
+
+        backend.close()
+
+        memory_allocator.close.assert_called_once()
 
     def test_str(self, local_cpu_backend):
         """Test string representation."""
