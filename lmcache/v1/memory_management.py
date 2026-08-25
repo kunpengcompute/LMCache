@@ -4,7 +4,7 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, List, Optional, Tuple, Union
 import abc
 import ctypes
@@ -374,9 +374,19 @@ class MemoryObj(metaclass=abc.ABCMeta):
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
+    use_spdk_dma: bool = False,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
+    if use_spdk_dma:
+        if numa_mapping is not None:
+            logger.warning(
+                "NUMA mapping is ignored when mooncake_use_spdk_dma is enabled"
+            )
+        ptr = _allocate_registered_spdk_memory(size)
+        array_type = ctypes.c_uint8 * size
+        buf = array_type.from_address(ptr)
+        return torch.frombuffer(buf, dtype=torch.uint8)
     if numa_mapping:
         if torch.cuda.is_available():
             current_device_id = torch.cuda.current_device()
@@ -402,13 +412,58 @@ def _free_cpu_memory(
     buffer: torch.Tensor,
     size: int | None = None,
     numa_mapping: Optional[NUMAMapping] = None,
+    use_spdk_dma: bool = False,
 ) -> torch.Tensor:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    if use_spdk_dma:
+        if torch.cuda.is_available():
+            lmc_ops.unregister_host_ptr(buffer.data_ptr())
+        _free_spdk_memory(buffer.data_ptr())
+        return
     if numa_mapping:
         lmc_ops.free_pinned_numa_ptr(buffer.data_ptr(), size)
     else:
         lmc_ops.free_pinned_ptr(buffer.data_ptr())
+
+
+@lru_cache(maxsize=1)
+def _get_spdk_allocator_functions():
+    from mooncake.store import get_alloc_func_addr, get_free_func_addr
+
+    alloc_addr = get_alloc_func_addr()
+    free_addr = get_free_func_addr()
+    if alloc_addr == 0 or free_addr == 0:
+        raise RuntimeError("Mooncake SPDK allocator helpers are unavailable")
+
+    alloc_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)(alloc_addr)
+    free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(free_addr)
+    return alloc_fn, free_fn
+
+
+def _allocate_spdk_memory(size: int) -> int:
+    alloc_fn, _ = _get_spdk_allocator_functions()
+    raw_ptr = alloc_fn(size)
+    ptr = ctypes.cast(raw_ptr, ctypes.c_void_p).value
+    if ptr is None:
+        raise RuntimeError(f"Mooncake SPDK allocation failed for size={size}")
+    return int(ptr)
+
+
+def _allocate_registered_spdk_memory(size: int) -> int:
+    ptr = _allocate_spdk_memory(size)
+    try:
+        if torch.cuda.is_available():
+            lmc_ops.register_host_ptr(ptr, size, 0)
+    except Exception:
+        _free_spdk_memory(ptr)
+        raise
+    return ptr
+
+
+def _free_spdk_memory(ptr: int) -> None:
+    _, free_fn = _get_spdk_allocator_functions()
+    free_fn(ctypes.c_void_p(ptr))
 
 
 def _allocate_gpu_memory(
@@ -1780,7 +1835,13 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
 class PinMemoryAllocator(MemoryAllocatorInterface):
     """Allocates memory in the pre-allocated pinned memory."""
 
-    def __init__(self, size: int, use_paging: bool = False, **kwargs):
+    def __init__(
+        self,
+        size: int,
+        use_paging: bool = False,
+        use_spdk_dma: bool = False,
+        **kwargs,
+    ):
         """
         :param int size: The size of the pinned memory in bytes.
         """
@@ -1788,11 +1849,15 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         if size == 0:
             self.buffer = torch.empty(0, dtype=torch.uint8)
         else:
-            ptr = lmc_ops.alloc_pinned_ptr(size, 0)
+            if use_spdk_dma:
+                ptr = _allocate_registered_spdk_memory(size)
+            else:
+                ptr = lmc_ops.alloc_pinned_ptr(size, 0)
             array_type = ctypes.c_uint8 * size
             buf = array_type.from_address(ptr)
             self.buffer = torch.frombuffer(buf, dtype=torch.uint8)
         self._unregistered = False
+        self.use_spdk_dma = use_spdk_dma
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
@@ -1864,7 +1929,12 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
                 torch.cuda.synchronize()
             if self.buffer.numel() == 0:
                 return
-            lmc_ops.free_pinned_ptr(self.buffer.data_ptr())
+            if self.use_spdk_dma:
+                if torch.cuda.is_available():
+                    lmc_ops.unregister_host_ptr(self.buffer.data_ptr())
+                _free_spdk_memory(self.buffer.data_ptr())
+            else:
+                lmc_ops.free_pinned_ptr(self.buffer.data_ptr())
             self._unregistered = True
 
     def __str__(self):
@@ -1877,16 +1947,23 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
               (2) byte_array buffer memory.
     """
 
-    def __init__(self, size: int, use_paging: bool = False, **kwargs):
+    def __init__(
+        self,
+        size: int,
+        use_paging: bool = False,
+        use_spdk_dma: bool = False,
+        **kwargs,
+    ):
         """
         :param int size: The size of the pinned memory in bytes.
         """
 
         self.numa_mapping = kwargs.get("numa_mapping", None)
+        self.use_spdk_dma = use_spdk_dma
 
         self.size = size
 
-        self.buffer = _allocate_cpu_memory(size, self.numa_mapping)
+        self.buffer = _allocate_cpu_memory(size, self.numa_mapping, use_spdk_dma)
 
         self._unregistered = False
 
@@ -2007,7 +2084,11 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 torch.cuda.synchronize()
             if self.buffer.numel() == 0:
                 return
-            if self.numa_mapping:
+            if self.use_spdk_dma:
+                if torch.cuda.is_available():
+                    lmc_ops.unregister_host_ptr(self.buffer.data_ptr())
+                _free_spdk_memory(self.buffer.data_ptr())
+            elif self.numa_mapping:
                 lmc_ops.free_pinned_numa_ptr(self.buffer.data_ptr(), self.size)
             else:
                 lmc_ops.free_pinned_ptr(self.buffer.data_ptr())
@@ -2257,8 +2338,12 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         dtypes: list[torch.dtype],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         numa_mapping: Optional[NUMAMapping] = None,
+        use_spdk_dma: bool = False,
     ):
-        self.cpu_buffer = _allocate_cpu_memory(size, numa_mapping)
+        self.cpu_numa_mapping = numa_mapping
+        self.cpu_use_spdk_dma = use_spdk_dma
+        self._cpu_buffer_closed = False
+        self.cpu_buffer = _allocate_cpu_memory(size, numa_mapping, use_spdk_dma)
         self.cpu_allocator = PagedTensorMemoryAllocator(
             self.cpu_buffer,
             shapes,
@@ -2316,6 +2401,27 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             self.cpu_allocator.batched_free(memory_objs, update_stats=update_stats)
         else:
             raise ValueError(f"Unsupported allocator type: {allocator_type}")
+
+    def close(self):
+        if getattr(self, "_cpu_buffer_closed", False):
+            return
+        if hasattr(self, "cpu_buffer") and isinstance(self.cpu_buffer, torch.Tensor):
+            if self.cpu_buffer.numel() == 0:
+                self._cpu_buffer_closed = True
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            if getattr(self, "cpu_use_spdk_dma", False):
+                _free_cpu_memory(self.cpu_buffer, use_spdk_dma=True)
+            elif getattr(self, "cpu_numa_mapping", None):
+                _free_cpu_memory(
+                    self.cpu_buffer,
+                    size=self.cpu_buffer.numel(),
+                    numa_mapping=self.cpu_numa_mapping,
+                )
+            else:
+                _free_cpu_memory(self.cpu_buffer)
+            self._cpu_buffer_closed = True
 
     def __str__(self):
         return "PDMemoryAllocator"

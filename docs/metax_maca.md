@@ -110,3 +110,24 @@ PY
 
 Only after these checks pass should vLLM be started with
 `kv_connector="LMCacheConnectorV1"` and `kv_role="kv_both"`.
+
+## Mooncake + NoF path
+
+To make LMCache buffers SPDK-friendly and let Mooncake place replicas on NoF,
+set these `extra_config` keys:
+
+```json
+{
+  "mooncake_use_spdk_dma": true,
+  "mooncake_replica_num": 1,
+  "mooncake_nof_replica_num": 1,
+  "mooncake_preferred_nof_segments": ["seg0"]
+}
+```
+
+Validation order on the target machine:
+
+1. Build Mooncake with `USE_NOF=1` and confirm `nvmeof` transport is enabled.
+2. Start LMCache with the config above.
+3. Check logs for `Registered:` from LMCache and NoF replica allocation from Mooncake.
+4. Run one `put`/`get` round-trip and verify the object lands on NoF storage.

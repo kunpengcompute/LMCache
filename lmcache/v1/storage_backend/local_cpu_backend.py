@@ -2,6 +2,7 @@
 # Standard
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+import os
 import threading
 import time
 
@@ -33,6 +34,18 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+
+def _get_extra_config_bool(config: LMCacheEngineConfig, key: str) -> bool:
+    env_key = f"LMCACHE_{key.upper()}"
+    value = os.environ.get(env_key)
+    if value is None:
+        value = config.get_extra_config_value(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -349,6 +362,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         metadata: Optional[LMCacheMetadata] = None,
     ) -> MemoryAllocatorInterface:
         cpu_size = config.max_local_cpu_size
+        use_spdk_dma = _get_extra_config_bool(config, "mooncake_use_spdk_dma")
+        if use_spdk_dma:
+            logger.info("Using Mooncake SPDK DMA allocator for local CPU memory")
 
         if metadata is not None:
             # save_only_first_rank only works when use mla
@@ -394,6 +410,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 dtypes=dtypes,
                 fmt=MemoryFormat.KV_2LTD,  # TODO: remove this hardcode
                 numa_mapping=numa_mapping,
+                use_spdk_dma=use_spdk_dma,
             )
             return paged_mem_allocator
         else:
@@ -421,6 +438,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return MixedMemoryAllocator(
                 int(cpu_size * 1024**3),
                 numa_mapping=numa_mapping,
+                use_spdk_dma=use_spdk_dma,
             )
 
     @_lmcache_nvtx_annotate

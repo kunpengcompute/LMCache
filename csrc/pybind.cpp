@@ -38,5 +38,9 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("alloc_numa_ptr", &alloc_numa_ptr,
         py::call_guard<py::gil_scoped_release>());
   m.def("free_numa_ptr", &free_numa_ptr);
+  m.def("register_host_ptr", &register_host_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("unregister_host_ptr", &unregister_host_ptr,
+        py::call_guard<py::gil_scoped_release>());
   m.def("get_gpu_pci_bus_id", &get_gpu_pci_bus_id);
 }
