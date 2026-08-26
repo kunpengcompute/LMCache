@@ -269,6 +269,13 @@ class MooncakestoreConnector(RemoteConnector):
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = self.config.replica_num
         self.replica_config.nof_replica_num = self.config.nof_replica_num
+        logger.info(
+            "Mooncake ReplicateConfig initialized: replica_num=%d, "
+            "nof_replica_num=%d, save_chunk_meta=%s",
+            self.config.replica_num,
+            self.config.nof_replica_num,
+            self.save_chunk_meta,
+        )
 
         # Set preferred_segment based on configuration
         if self.config.prefer_local_alloc:

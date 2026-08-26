@@ -189,6 +189,9 @@ class RemoteBackend(StorageBackendInterface):
         """
         with self.lock:
             self.put_tasks.discard(key)
+        exception = future.exception()
+        if exception is not None:
+            logger.warning("Remote put failed for key %s: %s", key, exception)
 
     def submit_put_task(
         self,
@@ -241,6 +244,10 @@ class RemoteBackend(StorageBackendInterface):
             self.connection.put(key, compressed_memory_obj), self.loop
         )
         future.add_done_callback(put_done_callback)
+        if self.config.extra_config is not None and self.config.extra_config.get(
+            "blocking_remote_put", False
+        ):
+            future.result(timeout=self.config.blocking_timeout_secs)
         return future
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
@@ -249,6 +256,13 @@ class RemoteBackend(StorageBackendInterface):
         """
         with self.lock:
             self.put_tasks.difference_update(keys)
+        exception = future.exception()
+        if exception is not None:
+            logger.warning(
+                "Remote batched put failed for %d keys: %s",
+                len(keys),
+                exception,
+            )
 
     def batched_submit_put_task(
         self,
@@ -303,6 +317,10 @@ class RemoteBackend(StorageBackendInterface):
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)
+            if self.config.extra_config is not None and self.config.extra_config.get(
+                "blocking_remote_put", False
+            ):
+                future.result(timeout=self.config.blocking_timeout_secs)
         else:
             for key, memory_obj in zip(keys, memory_objs, strict=False):
                 self.submit_put_task(
