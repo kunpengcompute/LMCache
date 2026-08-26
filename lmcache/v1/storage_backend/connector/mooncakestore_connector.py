@@ -155,6 +155,22 @@ class MooncakestoreConnector(RemoteConnector):
             config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
             if config_file_path is not None:
                 self.config = MooncakeStoreConfig.from_file(config_file_path)
+                if lmcache_config is not None:
+                    extra_config = lmcache_config.extra_config or {}
+                    if "mooncake_replica_num" in extra_config:
+                        self.config.replica_num = _to_int(
+                            extra_config["mooncake_replica_num"],
+                            self.config.replica_num,
+                        )
+                    if "mooncake_nof_replica_num" in extra_config:
+                        self.config.nof_replica_num = _to_int(
+                            extra_config["mooncake_nof_replica_num"],
+                            self.config.nof_replica_num,
+                        )
+                    if "mooncake_preferred_nof_segments" in extra_config:
+                        self.config.preferred_nof_segments = _normalize_string_list(
+                            extra_config["mooncake_preferred_nof_segments"]
+                        )
             elif lmcache_config is not None:
                 self.config = MooncakeStoreConfig.load_from_lmcache_config(
                     lmcache_config
@@ -644,7 +660,11 @@ class MooncakestoreConnector(RemoteConnector):
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
+                    self.store.put_parts,
+                    key_str,
+                    metadata_bytes,
+                    kv_bytes,
+                    config=self.replica_config,
                 ),
                 timeout=self.config.transfer_timeout,
             )
