@@ -217,6 +217,13 @@ class MPCacheEngine:
         chunk_size: int = 256,
         cpu_buffer_size: float = 5.0,
         disable_lazy_alloc: bool = False,
+        use_spdk_dma: bool = False,
+        mooncake_config_path: str | None = None,
+        mooncake_replica_num: int | None = None,
+        mooncake_nof_replica_num: int | None = None,
+        mooncake_preferred_nof_segments: list[str] | None = None,
+        remote_write_async: bool = True,
+        remote_workers: int = 2,
     ):
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
@@ -228,7 +235,17 @@ class MPCacheEngine:
         self.lock = threading.Lock()
 
         # storage manager
-        self.storage_manager = MPStorageManager(cpu_buffer_size, disable_lazy_alloc)
+        self.storage_manager = MPStorageManager(
+            cpu_buffer_size,
+            disable_lazy_alloc,
+            use_spdk_dma=use_spdk_dma,
+            mooncake_config_path=mooncake_config_path,
+            mooncake_replica_num=mooncake_replica_num,
+            mooncake_nof_replica_num=mooncake_nof_replica_num,
+            mooncake_preferred_nof_segments=mooncake_preferred_nof_segments,
+            remote_write_async=remote_write_async,
+            remote_workers=remote_workers,
+        )
 
     def register_kv_cache(self, instance_id: int, kv_caches: KVCache) -> None:
         """
@@ -436,7 +453,17 @@ class MPCacheEngine:
             event = torch.cuda.Event(interprocess=True)
 
             try:
-                with self.storage_manager.retrieve(keys) as memory_objs:
+                fmt = (
+                    MemoryFormat.KV_MLA_FMT
+                    if gpu_context.is_mla
+                    else MemoryFormat.KV_2LTD
+                )
+                with self.storage_manager.retrieve(
+                    keys,
+                    shape=gpu_context.get_kv_buffer_shape(self.chunk_size),
+                    dtype=gpu_context.dtype,
+                    fmt=fmt,
+                ) as memory_objs:
                     _retrieve_loop(keys, memory_objs)
             except Exception as e:
                 logger.warning("Cannot retrieve keys: %s", str(e))
@@ -529,6 +556,9 @@ class MPCacheEngine:
             self.storage_manager.clear()
             self.storage_manager.memcheck()
 
+    def close(self) -> None:
+        self.storage_manager.close()
+
 
 def add_handler_helper(
     server: MessageQueueServer, request_type: RequestType, handler_function
@@ -550,6 +580,13 @@ def run_cache_server(
     cpu_buffer_size: float = 5.0,
     max_workers: int = 1,
     disable_lazy_alloc: bool = False,
+    use_spdk_dma: bool = False,
+    mooncake_config_path: str | None = None,
+    mooncake_replica_num: int | None = None,
+    mooncake_nof_replica_num: int | None = None,
+    mooncake_preferred_nof_segments: list[str] | None = None,
+    remote_write_async: bool = True,
+    remote_workers: int = 2,
     return_engine: bool = False,
 ):
     """
@@ -569,7 +606,18 @@ def run_cache_server(
         If return_engine is False: None (blocks until interrupted)
     """
     # Initialize the engine
-    engine = MPCacheEngine(chunk_size, cpu_buffer_size, disable_lazy_alloc)
+    engine = MPCacheEngine(
+        chunk_size,
+        cpu_buffer_size,
+        disable_lazy_alloc,
+        use_spdk_dma=use_spdk_dma,
+        mooncake_config_path=mooncake_config_path,
+        mooncake_replica_num=mooncake_replica_num,
+        mooncake_nof_replica_num=mooncake_nof_replica_num,
+        mooncake_preferred_nof_segments=mooncake_preferred_nof_segments,
+        remote_write_async=remote_write_async,
+        remote_workers=remote_workers,
+    )
 
     # Initialize the message queue server
     context = zmq.Context.instance()
@@ -606,6 +654,7 @@ def run_cache_server(
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
         server.close()
+        engine.close()
 
 
 def parse_args():
@@ -631,6 +680,46 @@ def parse_args():
     parser.add_argument(
         "--disable-lazy-alloc", action="store_true", help="Disable lazy allocation"
     )
+    parser.add_argument(
+        "--use-spdk-dma",
+        action="store_true",
+        help="Allocate the MP host buffer with Mooncake SPDK DMA memory",
+    )
+    parser.add_argument(
+        "--mooncake-config",
+        type=str,
+        default=None,
+        help="Mooncake store_service.json for MP remote L2 storage",
+    )
+    parser.add_argument(
+        "--mooncake-replica-num",
+        type=int,
+        default=None,
+        help="Override Mooncake memory replica count",
+    )
+    parser.add_argument(
+        "--mooncake-nof-replica-num",
+        type=int,
+        default=None,
+        help="Override Mooncake NoF replica count",
+    )
+    parser.add_argument(
+        "--mooncake-preferred-nof-segments",
+        nargs="*",
+        default=None,
+        help="Preferred Mooncake NoF segment names",
+    )
+    parser.add_argument(
+        "--sync-remote-write",
+        action="store_true",
+        help="Wait for each Mooncake write instead of submitting asynchronously",
+    )
+    parser.add_argument(
+        "--remote-workers",
+        type=int,
+        default=2,
+        help="Worker threads for asynchronous Mooncake writes",
+    )
     return parser.parse_args()
 
 
@@ -643,4 +732,11 @@ if __name__ == "__main__":
         cpu_buffer_size=args.cpu_buffer_size,
         max_workers=args.max_workers,
         disable_lazy_alloc=args.disable_lazy_alloc,
+        use_spdk_dma=args.use_spdk_dma,
+        mooncake_config_path=args.mooncake_config,
+        mooncake_replica_num=args.mooncake_replica_num,
+        mooncake_nof_replica_num=args.mooncake_nof_replica_num,
+        mooncake_preferred_nof_segments=args.mooncake_preferred_nof_segments,
+        remote_write_async=not args.sync_remote_write,
+        remote_workers=args.remote_workers,
     )

@@ -19,6 +19,10 @@ spec:
           hostPath:
             path: /dev/shm
             type: Directory
+        - name: mooncake-config
+          hostPath:
+            path: /workspace/opt
+            type: Directory
       containers:
         - name: lmcache-server
           image: lmcache/standalone:nightly
@@ -34,9 +38,22 @@ spec:
             - "60"
             - --max-workers
             - "4"
+            - --disable-lazy-alloc
+            - --use-spdk-dma
+            - --mooncake-config
+            - "/workspace/opt/store_service.json"
+            - --mooncake-replica-num
+            - "0"
+            - --mooncake-nof-replica-num
+            - "1"
+            - --remote-workers
+            - "2"
           volumeMounts:
             - name: dev-shm
               mountPath: /dev/shm
+            - name: mooncake-config
+              mountPath: /workspace/opt
+              readOnly: true
           resources:
             requests:
               # 65Gi = 60GB cpu-buffer-size + ~5GB overhead for Python runtime and server operations

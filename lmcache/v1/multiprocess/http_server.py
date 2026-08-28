@@ -38,6 +38,13 @@ class ServerConfig:
     chunk_size: int = 256
     cpu_buffer_size: float = 5.0
     max_workers: int = 1
+    use_spdk_dma: bool = False
+    mooncake_config_path: str | None = None
+    mooncake_replica_num: int | None = None
+    mooncake_nof_replica_num: int | None = None
+    mooncake_preferred_nof_segments: list[str] | None = None
+    remote_write_async: bool = True
+    remote_workers: int = 2
 
 
 _server_config = ServerConfig()
@@ -62,6 +69,15 @@ async def lifespan(app: FastAPI):
         chunk_size=_server_config.chunk_size,
         cpu_buffer_size=_server_config.cpu_buffer_size,
         max_workers=_server_config.max_workers,
+        use_spdk_dma=_server_config.use_spdk_dma,
+        mooncake_config_path=_server_config.mooncake_config_path,
+        mooncake_replica_num=_server_config.mooncake_replica_num,
+        mooncake_nof_replica_num=_server_config.mooncake_nof_replica_num,
+        mooncake_preferred_nof_segments=(
+            _server_config.mooncake_preferred_nof_segments
+        ),
+        remote_write_async=_server_config.remote_write_async,
+        remote_workers=_server_config.remote_workers,
         return_engine=True,
     )
     app.state.zmq_server = zmq_server
@@ -74,6 +90,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down LMCache HTTP server...")
     if hasattr(app.state, "zmq_server") and app.state.zmq_server is not None:
         app.state.zmq_server.close()
+    if hasattr(app.state, "engine") and app.state.engine is not None:
+        app.state.engine.close()
     logger.info("LMCache HTTP server stopped")
 
 
@@ -684,6 +702,13 @@ def run_http_server(
     chunk_size: int = 256,
     cpu_buffer_size: float = 5.0,
     max_workers: int = 1,
+    use_spdk_dma: bool = False,
+    mooncake_config_path: str | None = None,
+    mooncake_replica_num: int | None = None,
+    mooncake_nof_replica_num: int | None = None,
+    mooncake_preferred_nof_segments: list[str] | None = None,
+    remote_write_async: bool = True,
+    remote_workers: int = 2,
 ):
     """
     Run the LMCache HTTP server with integrated MP (ZMQ) server.
@@ -709,6 +734,13 @@ def run_http_server(
     _server_config.chunk_size = chunk_size
     _server_config.cpu_buffer_size = cpu_buffer_size
     _server_config.max_workers = max_workers
+    _server_config.use_spdk_dma = use_spdk_dma
+    _server_config.mooncake_config_path = mooncake_config_path
+    _server_config.mooncake_replica_num = mooncake_replica_num
+    _server_config.mooncake_nof_replica_num = mooncake_nof_replica_num
+    _server_config.mooncake_preferred_nof_segments = mooncake_preferred_nof_segments
+    _server_config.remote_write_async = remote_write_async
+    _server_config.remote_workers = remote_workers
 
     config = uvicorn.Config(
         app=app,
@@ -748,6 +780,28 @@ def parse_args():
     parser.add_argument(
         "--max-workers", type=int, default=1, help="Maximum number of worker threads"
     )
+    parser.add_argument(
+        "--use-spdk-dma",
+        action="store_true",
+        help="Allocate the MP host buffer with Mooncake SPDK DMA memory",
+    )
+    parser.add_argument(
+        "--mooncake-config",
+        type=str,
+        default=None,
+        help="Mooncake store_service.json for MP remote L2 storage",
+    )
+    parser.add_argument("--mooncake-replica-num", type=int, default=None)
+    parser.add_argument("--mooncake-nof-replica-num", type=int, default=None)
+    parser.add_argument(
+        "--mooncake-preferred-nof-segments", nargs="*", default=None
+    )
+    parser.add_argument(
+        "--sync-remote-write",
+        action="store_true",
+        help="Wait for each Mooncake write instead of submitting asynchronously",
+    )
+    parser.add_argument("--remote-workers", type=int, default=2)
     return parser.parse_args()
 
 
@@ -761,4 +815,11 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         cpu_buffer_size=args.cpu_buffer_size,
         max_workers=args.max_workers,
+        use_spdk_dma=args.use_spdk_dma,
+        mooncake_config_path=args.mooncake_config,
+        mooncake_replica_num=args.mooncake_replica_num,
+        mooncake_nof_replica_num=args.mooncake_nof_replica_num,
+        mooncake_preferred_nof_segments=args.mooncake_preferred_nof_segments,
+        remote_write_async=not args.sync_remote_write,
+        remote_workers=args.remote_workers,
     )

@@ -33,6 +33,7 @@ spec:
                 --host 0.0.0.0 \
                 --port 8000 \
                 --no-enable-prefix-caching \
+                --disable-hybrid-kv-cache-manager \
                 --max-model-len 32768 \
                 --gpu-memory-utilization 0.85 \
                 --tensor-parallel-size 4 \
