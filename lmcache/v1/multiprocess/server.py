@@ -15,9 +15,13 @@ import argparse
 import array
 import threading
 import time
+from typing import Any, Callable, Optional
 
 # Third Party
-import cupy
+try:
+    import cupy
+except ImportError:
+    cupy = None
 import torch
 import zmq
 
@@ -42,6 +46,32 @@ from lmcache.v1.multiprocess.protocol import (
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+class _TorchHostCallbackStream:
+    """Fallback host callbacks for environments without cupy.cuda."""
+
+    def __init__(self, torch_stream: torch.cuda.Stream):
+        self.torch_stream = torch_stream
+
+    def launch_host_func(
+        self, callback: Callable[[Any], None], arg: Optional[Any] = None
+    ) -> None:
+        event = torch.cuda.Event()
+        event.record(self.torch_stream)
+
+        def wait_and_run() -> None:
+            try:
+                event.synchronize()
+                callback(arg)
+            except Exception:
+                logger.exception("Fallback CUDA host callback failed")
+
+        threading.Thread(
+            target=wait_and_run,
+            name="lmcache-cuda-host-callback",
+            daemon=True,
+        ).start()
 
 
 def unwrap_kv_cache_tensors(kv_caches: KVCache) -> list[torch.Tensor]:
@@ -110,9 +140,16 @@ class GPUCacheContext:
 
         # Cuda streams
         self.cuda_stream_ = torch.cuda.Stream(device=self.device_)
-        self.cupy_stream_ = cupy.cuda.ExternalStream(
-            self.cuda_stream_.cuda_stream, self.device_.index
-        )
+        if cupy is not None and hasattr(cupy, "cuda"):
+            self.cupy_stream_ = cupy.cuda.ExternalStream(
+                self.cuda_stream_.cuda_stream, self.device_.index
+            )
+        else:
+            logger.warning(
+                "cupy.cuda is unavailable; using a PyTorch Event callback "
+                "fallback for the multiprocess server"
+            )
+            self.cupy_stream_ = _TorchHostCallbackStream(self.cuda_stream_)
 
         # Extra initialization
         self.cupy_stream_.launch_host_func(
@@ -149,7 +186,7 @@ class GPUCacheContext:
         return self.cuda_stream_
 
     @property
-    def cupy_stream(self) -> cupy.cuda.Stream:
+    def cupy_stream(self) -> Any:
         return self.cupy_stream_
 
     @property
