@@ -163,6 +163,13 @@ class StorageKey:
     worker_id: int
     chunk_hash: bytes
 
+    def to_string(self) -> str:
+        """Return the stable key representation used by MP remote storage."""
+        return (
+            f"{self.model_name}@{self.world_size}@{self.worker_id}@"
+            f"{self.chunk_hash.hex()}"
+        )
+
     @staticmethod
     def IntHash2Bytes(chunk_hash: int) -> bytes:
         # NOTE: this is only used by tests

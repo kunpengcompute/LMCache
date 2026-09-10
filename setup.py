@@ -18,7 +18,43 @@ BUILDING_SDIST = "sdist" in sys.argv or os.environ.get("NO_CUDA_EXT", "0") == "1
 # New environment variable to choose between CUDA and HIP
 BUILD_WITH_HIP = os.environ.get("BUILD_WITH_HIP", "0") == "1"
 
+BUILD_WITH_MACA = os.environ.get("BUILD_WITH_MACA", "0") == "1"
+
 ENABLE_CXX11_ABI = os.environ.get("ENABLE_CXX11_ABI", "1") == "1"
+
+
+def cxx_abi_flag() -> str:
+    global ENABLE_CXX11_ABI
+    if ENABLE_CXX11_ABI:
+        return "-D_GLIBCXX_USE_CXX11_ABI=1"
+    return "-D_GLIBCXX_USE_CXX11_ABI=0"
+
+
+def cuda_sources() -> list[str]:
+    return [
+        "csrc/pybind.cpp",
+        "csrc/mem_kernels.cu",
+        "csrc/cal_cdf.cu",
+        "csrc/ac_enc.cu",
+        "csrc/ac_dec.cu",
+        "csrc/pos_kernels.cu",
+        "csrc/mem_alloc.cpp",
+        "csrc/utils.cpp",
+    ]
+
+
+def storage_manager_sources() -> list[str]:
+    return [
+        "csrc/storage_manager/pybind.cpp",
+        "csrc/storage_manager/ttl_lock.cpp",
+    ]
+
+
+def split_env_paths(name: str) -> list[str]:
+    value = os.environ.get(name)
+    if not value:
+        return []
+    return [path for path in value.split(os.pathsep) if path]
 
 
 def hipify_wrapper() -> None:
@@ -65,30 +101,11 @@ def cuda_extension() -> tuple[list, dict]:
     from torch.utils import cpp_extension  # Import here
 
     print("Building CUDA extensions")
-    global ENABLE_CXX11_ABI
-    if ENABLE_CXX11_ABI:
-        flag_cxx_abi = "-D_GLIBCXX_USE_CXX11_ABI=1"
-    else:
-        flag_cxx_abi = "-D_GLIBCXX_USE_CXX11_ABI=0"
-
-    cuda_sources = [
-        "csrc/pybind.cpp",
-        "csrc/mem_kernels.cu",
-        "csrc/cal_cdf.cu",
-        "csrc/ac_enc.cu",
-        "csrc/ac_dec.cu",
-        "csrc/pos_kernels.cu",
-        "csrc/mem_alloc.cpp",
-        "csrc/utils.cpp",
-    ]
-    storage_manager_sources = [
-        "csrc/storage_manager/pybind.cpp",
-        "csrc/storage_manager/ttl_lock.cpp",
-    ]
+    flag_cxx_abi = cxx_abi_flag()
     ext_modules = [
         cpp_extension.CUDAExtension(
             "lmcache.c_ops",
-            sources=cuda_sources,
+            sources=cuda_sources(),
             extra_compile_args={
                 "cxx": [flag_cxx_abi],
                 "nvcc": [flag_cxx_abi],
@@ -96,7 +113,83 @@ def cuda_extension() -> tuple[list, dict]:
         ),
         cpp_extension.CppExtension(
             "lmcache.native_storage_ops",
-            sources=storage_manager_sources,
+            sources=storage_manager_sources(),
+            include_dirs=["csrc/storage_manager"],
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-O3"],
+            },
+        ),
+    ]
+    cmdclass = {"build_ext": cpp_extension.BuildExtension}
+    return ext_modules, cmdclass
+
+
+def maca_extension() -> tuple[list, dict]:
+    import torch
+
+    print("Building MetaX MACA extensions")
+    print(f"torch version: {torch.__version__}")
+    print(f"torch.version.cuda: {getattr(torch.version, 'cuda', None)}")
+    print(f"torch.version.maca: {getattr(torch.version, 'maca', None)}")
+
+    flag_cxx_abi = cxx_abi_flag()
+    maca_home = os.environ.get("MACA_HOME") or os.environ.get("LMCACHE_MACA_HOME")
+    maca_compiler = os.environ.get("MACA_COMPILER") or os.environ.get(
+        "LMCACHE_MACA_COMPILER"
+    )
+    include_dirs = split_env_paths("LMCACHE_MACA_INCLUDE_DIRS")
+    library_dirs = split_env_paths("LMCACHE_MACA_LIBRARY_DIRS")
+
+    if maca_home and "CUDA_HOME" not in os.environ:
+        os.environ["CUDA_HOME"] = maca_home
+
+    if maca_compiler:
+        os.environ.setdefault("CUDACXX", maca_compiler)
+
+    from torch.utils import cpp_extension  # Import here
+
+    if maca_home:
+        include_dirs.append(os.path.join(maca_home, "include"))
+        library_dirs.extend(
+            [
+                os.path.join(maca_home, "lib"),
+                os.path.join(maca_home, "lib64"),
+            ]
+        )
+    else:
+        print(
+            "MACA_HOME/LMCACHE_MACA_HOME is not set; relying on torch+metax "
+            "and compiler default search paths."
+        )
+
+    if maca_compiler:
+        print(f"Using MACA compiler from environment: {maca_compiler}")
+    else:
+        print(
+            "MACA_COMPILER/LMCACHE_MACA_COMPILER is not set; relying on "
+            "torch.utils.cpp_extension compiler discovery."
+        )
+
+    print(f"torch.utils.cpp_extension.CUDA_HOME: {cpp_extension.CUDA_HOME}")
+    print(f"MACA include dirs: {include_dirs}")
+    print(f"MACA library dirs: {library_dirs}")
+
+    define_macros = [("USE_MACA", "1")]
+    ext_modules = [
+        cpp_extension.CUDAExtension(
+            "lmcache.c_ops",
+            sources=cuda_sources(),
+            include_dirs=include_dirs,
+            library_dirs=library_dirs,
+            define_macros=define_macros,
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-DUSE_MACA"],
+                "nvcc": [flag_cxx_abi, "-DUSE_MACA"],
+            },
+        ),
+        cpp_extension.CppExtension(
+            "lmcache.native_storage_ops",
+            sources=storage_manager_sources(),
             include_dirs=["csrc/storage_manager"],
             extra_compile_args={
                 "cxx": [flag_cxx_abi, "-O3"],
@@ -122,10 +215,6 @@ def rocm_extension() -> tuple[list, dict]:
         "csrc/pos_kernels.hip",
         "csrc/mem_alloc_hip.cpp",
         "csrc/utils_hip.cpp",
-    ]
-    storage_manager_sources = [
-        "csrc/storage_manager/pybind.cpp",
-        "csrc/storage_manager/ttl_lock.cpp",
     ]
     # For HIP, we generally use CppExtension and let hipcc handle things.
     # Ensure CXX environment variable is set to hipcc when running this build.
@@ -159,7 +248,7 @@ def rocm_extension() -> tuple[list, dict]:
         ),
         cpp_extension.CppExtension(
             "lmcache.native_storage_ops",
-            sources=storage_manager_sources,
+            sources=storage_manager_sources(),
             include_dirs=["csrc/storage_manager"],
             extra_compile_args={
                 "cxx": ["-O3"],
@@ -171,13 +260,15 @@ def rocm_extension() -> tuple[list, dict]:
 
 
 def source_dist_extension() -> tuple[list, dict]:
-    print("Not building CUDA/HIP extensions for sdist")
+    print("Not building CUDA/HIP/MACA extensions for sdist")
     return [], {}
 
 
 if __name__ == "__main__":
     if BUILDING_SDIST:
         get_extension = source_dist_extension
+    elif BUILD_WITH_MACA:
+        get_extension = maca_extension
     elif BUILD_WITH_HIP:
         get_extension = rocm_extension
     else:

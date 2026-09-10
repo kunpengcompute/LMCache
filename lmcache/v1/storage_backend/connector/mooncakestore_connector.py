@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import reduce
 from typing import List, Optional, no_type_check
 import asyncio
@@ -26,6 +26,20 @@ logger = init_logger(__name__)
 METADATA_BYTES_LEN = 28
 
 
+def _normalize_string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item for item in value.split(",") if item]
+    return list(value)
+
+
+def _to_int(value, default: int) -> int:
+    if value is None:
+        return default
+    return int(value)
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -38,6 +52,9 @@ class MooncakeStoreConfig:
     transfer_timeout: int
     storage_root_dir: str
     prefer_local_alloc: bool = False
+    replica_num: int = 1
+    nof_replica_num: int = 0
+    preferred_nof_segments: list[str] = field(default_factory=list)
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -46,6 +63,9 @@ class MooncakeStoreConfig:
             config = json.load(fin)
         # Read Mooncake-specific knob
         prefer_local_alloc = config.get("mooncake_prefer_local_alloc", False)
+        preferred_nof_segments = _normalize_string_list(
+            config.get("mooncake_preferred_nof_segments", None)
+        )
 
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
@@ -58,6 +78,9 @@ class MooncakeStoreConfig:
             transfer_timeout=config.get("transfer_timeout", 1),
             storage_root_dir=config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            replica_num=_to_int(config.get("mooncake_replica_num"), 1),
+            nof_replica_num=_to_int(config.get("mooncake_nof_replica_num"), 0),
+            preferred_nof_segments=preferred_nof_segments,
         )
 
     @staticmethod
@@ -80,6 +103,9 @@ class MooncakeStoreConfig:
             raise ValueError("The extra config is not set.")
         # Read Mooncake-specific knob
         prefer_local_alloc = extra_config.get("mooncake_prefer_local_alloc", False)
+        preferred_nof_segments = _normalize_string_list(
+            extra_config.get("mooncake_preferred_nof_segments")
+        )
 
         return MooncakeStoreConfig(
             local_hostname=extra_config["local_hostname"],
@@ -92,6 +118,9 @@ class MooncakeStoreConfig:
             transfer_timeout=extra_config.get("transfer_timeout", 1),
             storage_root_dir=extra_config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            replica_num=_to_int(extra_config.get("mooncake_replica_num"), 1),
+            nof_replica_num=_to_int(extra_config.get("mooncake_nof_replica_num"), 0),
+            preferred_nof_segments=preferred_nof_segments,
         )
 
 
@@ -126,6 +155,22 @@ class MooncakestoreConnector(RemoteConnector):
             config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
             if config_file_path is not None:
                 self.config = MooncakeStoreConfig.from_file(config_file_path)
+                if lmcache_config is not None:
+                    extra_config = lmcache_config.extra_config or {}
+                    if "mooncake_replica_num" in extra_config:
+                        self.config.replica_num = _to_int(
+                            extra_config["mooncake_replica_num"],
+                            self.config.replica_num,
+                        )
+                    if "mooncake_nof_replica_num" in extra_config:
+                        self.config.nof_replica_num = _to_int(
+                            extra_config["mooncake_nof_replica_num"],
+                            self.config.nof_replica_num,
+                        )
+                    if "mooncake_preferred_nof_segments" in extra_config:
+                        self.config.preferred_nof_segments = _normalize_string_list(
+                            extra_config["mooncake_preferred_nof_segments"]
+                        )
             elif lmcache_config is not None:
                 self.config = MooncakeStoreConfig.load_from_lmcache_config(
                     lmcache_config
@@ -222,11 +267,23 @@ class MooncakestoreConnector(RemoteConnector):
 
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
-        self.replica_config.replica_num = 1
+        self.replica_config.replica_num = self.config.replica_num
+        self.replica_config.nof_replica_num = self.config.nof_replica_num
+        logger.info(
+            "Mooncake ReplicateConfig initialized: replica_num=%d, "
+            "nof_replica_num=%d, save_chunk_meta=%s",
+            self.config.replica_num,
+            self.config.nof_replica_num,
+            self.save_chunk_meta,
+        )
 
         # Set preferred_segment based on configuration
         if self.config.prefer_local_alloc:
             self.replica_config.preferred_segment = self.store.get_hostname()
+        if self.config.preferred_nof_segments:
+            self.replica_config.preferred_nof_segments = (
+                self.config.preferred_nof_segments
+            )
 
         # Register CPU buffer for zero-copy operations
         self._register_cpu_buffer()
@@ -237,20 +294,28 @@ class MooncakestoreConnector(RemoteConnector):
         """Register CPU buffer for zero-copy operations."""
         try:
             allocator = self.local_cpu_backend.memory_allocator
-            if hasattr(allocator, "pin_allocator") and hasattr(
+            buffer = None
+            if hasattr(allocator, "buffer"):
+                buffer = allocator.buffer
+            elif hasattr(allocator, "pin_allocator") and hasattr(
                 allocator.pin_allocator, "buffer"
             ):
                 buffer = allocator.pin_allocator.buffer
-                self.registered_buffer_ptr = buffer.data_ptr()
-                result = self.store.register_buffer(buffer.data_ptr(), buffer.numel())
-                if result == 0:
-                    logger.info(
-                        f"Registered: {hex(buffer.data_ptr())}, {buffer.numel()} bytes"
-                    )
-                else:
-                    logger.warning(f"Buffer registration failed: error={result}")
-                    self.registered_buffer_ptr = None
+            elif hasattr(allocator, "cpu_buffer"):
+                buffer = allocator.cpu_buffer
+
+            if buffer is None:
+                self.registered_buffer_ptr = None
+                return
+
+            self.registered_buffer_ptr = buffer.data_ptr()
+            result = self.store.register_buffer(buffer.data_ptr(), buffer.numel())
+            if result == 0:
+                logger.info(
+                    f"Registered: {hex(buffer.data_ptr())}, {buffer.numel()} bytes"
+                )
             else:
+                logger.warning(f"Buffer registration failed: error={result}")
                 self.registered_buffer_ptr = None
         except Exception as e:
             logger.error(f"Buffer registration error: {e}")
@@ -602,7 +667,11 @@ class MooncakestoreConnector(RemoteConnector):
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
+                    self.store.put_parts,
+                    key_str,
+                    metadata_bytes,
+                    kv_bytes,
+                    config=self.replica_config,
                 ),
                 timeout=self.config.transfer_timeout,
             )

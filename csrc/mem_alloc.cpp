@@ -94,3 +94,19 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
     throw std::runtime_error(std::string("munmap failed: ") + strerror(errno));
   }
 }
+
+void register_host_ptr(uintptr_t ptr, size_t size, unsigned int flags) {
+  cudaError_t st = cudaHostRegister(reinterpret_cast<void*>(ptr), size, flags);
+  if (st != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaHostRegister failed: ") +
+                             cudaGetErrorString(st));
+  }
+}
+
+void unregister_host_ptr(uintptr_t ptr) {
+  cudaError_t st = cudaHostUnregister(reinterpret_cast<void*>(ptr));
+  if (st != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaHostUnregister failed: ") +
+                             cudaGetErrorString(st));
+  }
+}

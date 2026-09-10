@@ -26,6 +26,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.multiprocess.custom_types import StorageKey
 from lmcache.v1.storage_backend.cache_policy.lru import LRUCachePolicy
+from lmcache.v1.multiprocess.mooncake_storage import MooncakeMPStorage
 
 logger = init_logger(__name__)
 
@@ -190,7 +191,18 @@ class LRUCachePolicyWithLock(LRUCachePolicy[StorageKey]):
 
 
 class MPStorageManager:
-    def __init__(self, cpu_buffer_size: float, disable_lazy_alloc: bool = False):
+    def __init__(
+        self,
+        cpu_buffer_size: float,
+        disable_lazy_alloc: bool = False,
+        use_spdk_dma: bool = False,
+        mooncake_config_path: str | None = None,
+        mooncake_replica_num: int | None = None,
+        mooncake_nof_replica_num: int | None = None,
+        mooncake_preferred_nof_segments: list[str] | None = None,
+        remote_write_async: bool = True,
+        remote_workers: int = 2,
+    ):
         """
         Args:
             cpu_buffer_size: the total size (in GB) of CPU memory buffer
@@ -205,12 +217,35 @@ class MPStorageManager:
         # implementation in the future)
         self._memory_allocator: MemoryAllocatorInterface
         size_in_bytes = int(cpu_buffer_size * (1 << 30))  # Convert GB to bytes
-        if disable_lazy_alloc:
-            self._memory_allocator = MixedMemoryAllocator(size_in_bytes)
+        use_mixed_allocator = (
+            disable_lazy_alloc or use_spdk_dma or mooncake_config_path is not None
+        )
+        if use_mixed_allocator:
+            if not disable_lazy_alloc and use_spdk_dma:
+                logger.warning(
+                    "Disabling lazy allocation because SPDK DMA memory requires "
+                    "a single registered host buffer."
+                )
+            self._memory_allocator = MixedMemoryAllocator(
+                size_in_bytes,
+                use_spdk_dma=use_spdk_dma,
+            )
         else:
             init_size_in_bytes = min(20 << 30, size_in_bytes)  # 20 GB or total size
             self._memory_allocator = LazyMemoryAllocator(
                 init_size_in_bytes, size_in_bytes
+            )
+
+        self._mooncake_storage = None
+        if mooncake_config_path is not None:
+            self._mooncake_storage = MooncakeMPStorage(
+                mooncake_config_path,
+                self._memory_allocator,
+                replica_num=mooncake_replica_num,
+                nof_replica_num=mooncake_nof_replica_num,
+                preferred_nof_segments=mooncake_preferred_nof_segments,
+                async_put=remote_write_async,
+                max_workers=remote_workers,
             )
 
         self._allocator_lock = threading.Lock()
@@ -390,6 +425,7 @@ class MPStorageManager:
     def commit(
         self,
         reserve_handle: ReserveHandle,
+        persist_remote: bool = True,
     ) -> None:
         """Mark the reserved memory objects as "ready to be used/retrieved".
 
@@ -415,6 +451,22 @@ class MPStorageManager:
                 self._cache_policy.update_on_put(key)
                 self._reserved_keys.remove(key)
 
+        if persist_remote and self._mooncake_storage and reserved_dict:
+            keys = list(reserved_dict.keys())
+            objects = list(reserved_dict.values())
+            self._mooncake_storage.submit_put(keys, objects)
+
+    def _discard_reservation(self, reserve_handle: ReserveHandle) -> None:
+        with self._allocator_lock, self._buffer_lock:
+            reserved_dict = self._reserved_memory_object_pools.pop(
+                reserve_handle, None
+            )
+            if reserved_dict is None:
+                return
+            for key, memory_obj in reserved_dict.items():
+                self._reserved_keys.discard(key)
+                memory_obj.ref_count_down()
+
     @_lmcache_nvtx_annotate
     def lookup(
         self,
@@ -430,13 +482,18 @@ class MPStorageManager:
         """
         # TODO: implement LOCK mechanism
         found_count = 0
-        with self._buffer_lock:
-            for key in keys:
-                if key in self._commited_memory_objects:
-                    found_count += 1
-                    self._obj_lock_manager.lock(key)
-                else:
-                    break
+        for key in keys:
+            with self._buffer_lock:
+                local_hit = key in self._commited_memory_objects
+            remote_hit = (
+                False
+                if local_hit or self._mooncake_storage is None
+                else self._mooncake_storage.contains(key)
+            )
+            if not local_hit and not remote_hit:
+                break
+            found_count += 1
+            self._obj_lock_manager.lock(key)
         return found_count
 
     @_lmcache_nvtx_annotate
@@ -444,6 +501,9 @@ class MPStorageManager:
     def retrieve(
         self,
         keys: list[StorageKey],
+        shape: torch.Size | None = None,
+        dtype: torch.dtype | None = None,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
     ) -> Iterator[list[MemoryObj]]:
         """Retrieve the memory objects for the given keys.
         The memory objects should be locked before retrieval.
@@ -465,6 +525,30 @@ class MPStorageManager:
         # gives us more flexibility when we have to wait for objects from
         # the L2 memory. Also, it's easier to manage the locking/unlocking,
         # and the ref-counting of the memory objects.
+        missing_keys: list[StorageKey] = []
+        with self._buffer_lock:
+            missing_keys = [
+                key for key in keys if key not in self._commited_memory_objects
+            ]
+
+        if missing_keys:
+            if self._mooncake_storage is None or shape is None or dtype is None:
+                raise RuntimeError(
+                    "Requested MP KV cache is not in local memory and remote "
+                    "storage is unavailable"
+                )
+            for key in missing_keys:
+                handle, reserved = self.reserve([key], shape, dtype, fmt)
+                memory_obj = reserved.get(key)
+                if memory_obj is None:
+                    raise RuntimeError(f"Failed to allocate remote KV cache for {key}")
+                try:
+                    self._mooncake_storage.get_into(key, memory_obj)
+                    self.commit(handle, persist_remote=False)
+                except Exception:
+                    self._discard_reservation(handle)
+                    raise
+
         def _touch_and_get_object(key):
             """
             Raises:
@@ -519,6 +603,8 @@ class MPStorageManager:
         """
         Release the resources held by the storage manager.
         """
+        if self._mooncake_storage is not None:
+            self._mooncake_storage.close()
         self._memory_allocator.close()
 
     def memcheck(self):
