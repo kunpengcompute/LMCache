@@ -1,0 +1,121 @@
+# 两种使用方式（任选其一）：
+#   A. 用本文件自行构建镜像（适合需要改依赖/改版本的场景）:
+#      注意：构建时需加 --network=host，否则容器内 DNS 可能无法解析 repo.openeuler.org
+#      docker build --network=host -f Dockerfile.arm64 -t lmcache-ttfhw .
+#   B. 直接拉取已用本文件构建好的镜像（省去构建时间，镜像内环境与本文件一致）:
+#      docker pull swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler22.03_lts_sp3:LMCache_26.3.0.01
+#      拉取后可直接按 A 的方式挂载源码使用，无需再 build
+
+FROM swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler22.03_lts_sp3:latest
+
+
+
+# ---- 0. 包索引与 pip 全局行为 ----
+ENV PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
+ENV UV_DEFAULT_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
+# 不把下载缓存打进镜像层 (torch/transformers 体积大)
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# ---- 1. 系统依赖 (含源码编译 Python 3.11 所需 -devel 包) ----
+RUN dnf install -y \
+        gcc gcc-c++ make \
+        git curl sudo ca-certificates \
+        zlib-devel openssl-devel libffi-devel \
+        bzip2-devel xz-devel sqlite-devel readline-devel ncurses-devel \
+        libxcb \
+    && dnf clean all \
+    && test "$(uname -m)" = "aarch64" \
+    && echo "arch check OK: $(uname -m)"
+
+# ---- 1.1 源码编译 Python 3.11.9 ----
+RUN curl -fsSL https://mirrors.huaweicloud.com/python/3.11.9/Python-3.11.9.tgz -o /tmp/python.tgz \
+    && tar -xzf /tmp/python.tgz -C /tmp \
+    && cd /tmp/Python-3.11.9 \
+    && ./configure --prefix=/usr/local --with-ensurepip=install \
+    && make -j"$(nproc)" \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/Python-3.11.9 /tmp/python.tgz \
+    && python3.11 --version
+
+# ---- 2. 创建 Python 3.11 虚拟环境 ----
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN python3.11 -m venv /opt/venv \
+    && (/opt/venv/bin/pip --version >/dev/null 2>&1 || /opt/venv/bin/python -m ensurepip --upgrade) \
+    && pip install --upgrade pip \
+    && pip install uv \
+    && python3 --version \
+    && python3 -c "import sys; assert sys.version_info >= (3, 10), f'Python {sys.version} < 3.10'; print('Python version OK')" \
+    && uv --version
+
+# ---- 3. 安装 torch 2.8.0 (aarch64 CPU) ----
+RUN (pip install "torch==2.8.0" \
+        || pip install "torch==2.8.0+cpu" \
+           --extra-index-url https://download.pytorch.org/whl/cpu) \
+    && python3 -c "import torch; print('torch', torch.__version__); assert not torch.cuda.is_available(), 'should be CPU-only'; print('torch CUDA check: CPU-only OK')"
+
+# ---- 4. 安装构建依赖 (requirements/build.txt) ----
+RUN pip install \
+        ninja \
+        "packaging>=24.2" \
+        "setuptools>=77.0.3,<81.0.0" \
+        "setuptools_scm>=8" \
+        wheel \
+    && python3 -c "import ninja, packaging, setuptools; print('build deps OK')"
+
+# ---- 5. 安装运行时依赖 (requirements/common.txt, 排除 GPU 专属包) ----
+RUN pip install \
+        aiofile \
+        aiofiles \
+        aiohttp \
+        fastapi \
+        httpx \
+        msgspec \
+        "numpy<=2.2.6" \
+        nvtx \
+        "prometheus_client>=0.18.0" \
+        psutil \
+        py-cpuinfo \
+        pyyaml \
+        "pyzmq>=25.0.0" \
+        redis \
+        safetensors \
+        "setuptools>=77.0.3,<81.0.0" \
+        "setuptools_scm>=8" \
+        sortedcontainers \
+        "transformers>=4.51.1" \
+        uvicorn \
+        httptools \
+        networkx \
+        sympy \
+        requests \
+    && python3 -c "import aiofile, aiofiles, aiohttp, fastapi, httpx, msgspec, numpy, nvtx, prometheus_client, psutil, cpuinfo, yaml, zmq, redis, safetensors, sortedcontainers, transformers, uvicorn, httptools; print('runtime deps OK')"
+
+# ---- 6. 安装测试依赖 (requirements/test.txt) ----
+RUN pip install \
+        "pytest>=7.0,<9.1" \
+        pytest-asyncio \
+        pytest-benchmark \
+        "pytest-benchmark[histogram]" \
+        pytest-cov \
+        "pytest-html>=3.2,<5.0" \
+        "jinja2<3.2" \
+        python-multipart \
+    && python3 -c "import pytest; print('pytest', pytest.__version__)" \
+    && pytest --version
+
+# ---- 7. 安装 pre-commit (requirements/lint.txt) ----
+# 源码依据: requirements/lint.txt (pre-commit==4.5.0)
+# 镜像源若只有 4.3.0, 回退到 >=4.0
+RUN (pip install "pre-commit==4.5.0" \
+        || pip install "pre-commit>=4.0") \
+    && pre-commit --version
+
+# ---- 8. 设置环境变量 ----
+ENV NO_CUDA_EXT=1
+ENV SKIP=mypy
+
+# ---- 9. 工作目录 ----
+WORKDIR /workspace
+CMD ["/bin/bash"]
